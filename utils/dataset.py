@@ -123,7 +123,7 @@ class ORIONDataset(Dataset):
 if __name__ == '__main__':
     from torch.utils.data import DataLoader
 
-    DATA_DIR = Path('../data/raw/ORION_AE_acoustic_emission_multisensor_datasets_bolts_loosening')
+    DATA_DIR = Path('data/raw/ORION_AE_acoustic_emission_multisensor_datasets_bolts_loosening')
 
     train_files, test_files = get_split_files(DATA_DIR)
 
