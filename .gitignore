@@ -5,3 +5,6 @@ __pycache__/
 *.mat
 data/raw/
 outputs/
+data/processed
+best_model.pt
+

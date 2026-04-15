@@ -57,7 +57,7 @@ def parse_filename(filepath):
 
 def load_mat_signals(filepath):
     # load one .mat file and return AE channels A, B, C as (3, N) float32
-    # channel D is the vibrometer — excluded, validation only
+    # channel D is the vibrometer -- excluded, validation only
     mat = scipy.io.loadmat(filepath)
     signals = np.stack([
         mat['A'].squeeze(),
@@ -84,23 +84,94 @@ def get_split_files(data_dir):
     return train_files, test_files
 
 
+def preprocess_and_cache(files, cache_dir, window_size=WINDOW_SIZE, stride=WINDOW_STRIDE):
+    # pre-process all .mat files into windowed tensors and save to disk
+    # run once -- subsequent training loads from cache instead of raw .mat files
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    total_windows = 0
+    for i, filepath in enumerate(files):
+        info     = parse_filename(filepath)
+        label    = info['class_label']
+        cache_path = cache_dir / (filepath.stem + '.pt')
+
+        if cache_path.exists():
+            # already cached -- skip
+            data = torch.load(cache_path, weights_only=True)
+            total_windows += data['windows'].shape[0]
+            continue
+
+        # load and window
+        signals  = load_mat_signals(filepath)   # (3, N)
+        n        = signals.shape[1]
+        starts   = list(range(0, n - window_size + 1, stride))
+        windows  = np.stack([signals[:, s:s+window_size] for s in starts])  # (n_windows, 3, window_size)
+
+        torch.save({
+            'windows': torch.from_numpy(windows),   # (n_windows, 3, 10000) float32
+            'label'  : label,
+            'file'   : filepath.name,
+        }, cache_path)
+
+        total_windows += len(starts)
+
+        if (i + 1) % 20 == 0 or (i + 1) == len(files):
+            print(f'  cached {i+1}/{len(files)} files  ({total_windows:,} windows so far)')
+
+    print(f'Cache complete: {total_windows:,} windows in {cache_dir}')
+    return total_windows
+
+
 class ORIONDataset(Dataset):
 
-    def __init__(self, files, transform=None, window_size=WINDOW_SIZE, stride=WINDOW_STRIDE):
+    def __init__(self, files, transform=None, window_size=WINDOW_SIZE, stride=WINDOW_STRIDE, cache_dir=None):
         self.files       = files
         self.transform   = transform
         self.window_size = window_size
         self.stride      = stride
-        self._build_index()
+        self.cache_dir   = Path(cache_dir) if cache_dir else None
+
+        if self.cache_dir and self.cache_dir.exists():
+            self._build_index_from_cache()
+        else:
+            self._build_index()
+
+    def _build_index_from_cache(self):
+        # build index from pre-cached .pt files -- much faster than reading .mat files
+        self.index      = []
+        self.cache_data = {}   # filepath.stem -> loaded tensor dict
+
+        for filepath in self.files:
+            cache_path = self.cache_dir / (filepath.stem + '.pt')
+            if not cache_path.exists():
+                print(f'WARNING: cache missing for {filepath.name} -- falling back to raw load')
+                info      = parse_filename(filepath)
+                label     = info['class_label']
+                mat       = scipy.io.loadmat(filepath, variable_names=['A'])
+                n_samples = mat['A'].shape[0]
+                for s in range(0, n_samples - self.window_size + 1, self.stride):
+                    self.index.append(('raw', filepath, label, s))
+                continue
+
+            # load cache into memory
+            data = torch.load(cache_path, weights_only=True)
+            key  = filepath.stem
+            self.cache_data[key] = data
+
+            label      = data['label']
+            n_windows  = data['windows'].shape[0]
+            for i in range(n_windows):
+                self.index.append(('cached', key, label, i))
+
+        print(f'Dataset built from cache: {len(self.index):,} windows from {len(self.files)} files')
 
     def _build_index(self):
-        # build a flat list of (filepath, label, window_start) for every window
-        # across all files — lets DataLoader shuffle freely across files
+        # build index from raw .mat files -- slower but no cache needed
         self.index = []
         for filepath in self.files:
             info      = parse_filename(filepath)
             label     = info['class_label']
-            # load only channel A to get sample count — avoids loading full file
             mat       = scipy.io.loadmat(filepath, variable_names=['A'])
             n_samples = mat['A'].shape[0]
             for s in range(0, n_samples - self.window_size + 1, self.stride):
@@ -111,24 +182,43 @@ class ORIONDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, idx):
-        filepath, label, start = self.index[idx]
-        signals = load_mat_signals(filepath)
-        window  = signals[:, start : start + self.window_size]  # (3, window_size)
-        window  = torch.from_numpy(window)
+        entry = self.index[idx]
+
+        if entry[0] == 'cached':
+            # fast path -- load from in-memory cache
+            _, key, label, window_idx = entry
+            window = self.cache_data[key]['windows'][window_idx]   # (3, 10000)
+        else:
+            # slow path -- load from raw .mat file
+            filepath, label, start = entry
+            signals = load_mat_signals(filepath)
+            window  = torch.from_numpy(signals[:, start:start + self.window_size])
+
         if self.transform:
-            window = self.transform(window)
-        return window, label
+            window = self.transform(window.float())
+
+        return window.float(), label
 
 
 if __name__ == '__main__':
     from torch.utils.data import DataLoader
 
-    DATA_DIR = Path('data/raw/ORION_AE_acoustic_emission_multisensor_datasets_bolts_loosening')
+    DATA_DIR  = Path('data/raw/ORION_AE_acoustic_emission_multisensor_datasets_bolts_loosening')
+    CACHE_DIR = Path('data/processed/cache')
 
     train_files, test_files = get_split_files(DATA_DIR)
 
-    # test with first 2 files only for speed
-    dataset       = ORIONDataset(train_files[:2])
+    # pre-process and cache all train + test files
+    # run this once -- takes ~30 minutes, saves ~32 GB to data/processed/cache/
+    print('\nCaching train files...')
+    preprocess_and_cache(train_files, CACHE_DIR)
+
+    print('\nCaching test files...')
+    preprocess_and_cache(test_files, CACHE_DIR)
+
+    # test loading from cache
+    print('\nTesting cached dataset...')
+    dataset       = ORIONDataset(train_files[:2], cache_dir=CACHE_DIR)
     window, label = dataset[0]
     print(f'Window shape : {window.shape}')
     print(f'Label        : {label}')
@@ -137,3 +227,4 @@ if __name__ == '__main__':
     x, y   = next(iter(loader))
     print(f'Batch x      : {x.shape}')
     print(f'Batch y      : {y}')
+    print('\nAll checks passed.')

@@ -110,7 +110,7 @@ def train_simclr(
         train_files = train_files[:max_files]
         print(f'Using {max_files} files for quick test')
 
-    dataset = ORIONDataset(train_files, transform=None)
+    dataset = ORIONDataset(train_files, transform=None, cache_dir='data/processed/cache')
     loader  = DataLoader(
         dataset,
         batch_size  = batch_size,
