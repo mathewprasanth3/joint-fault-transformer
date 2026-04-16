@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 import sys
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from utils.dataset import ORIONDataset, get_split_files, NUM_CLASSES
+from utils.transforms import supervised_transform
 from models.transformer.model import JointFaultTransformer
 
 
@@ -19,13 +20,12 @@ def train_phase2(
     num_layers       = 2,
     batch_size       = 64,
     num_epochs       = 75,
-    lr               = 3e-5,
-    dropout          = 0.3,
-    val_campaign     = 'D',
+    lr               = 1e-4,
+    dropout          = 0.1,
+    val_split        = 0.1,
     num_workers      = 0,
     freeze_encoder   = False,
     cache_dir        = 'data/processed/cache',
-    weight_decay     = 1e-4,
 ):
     device = torch.device('mps' if torch.backends.mps.is_available() else
                           'cuda' if torch.cuda.is_available() else 'cpu')
@@ -33,23 +33,19 @@ def train_phase2(
 
     train_files, test_files = get_split_files(data_dir)
 
-    # campaign-wise split -- use campaign D as validation
-    # forces model to generalise across campaign boundaries
-    train_files_inner = [f for f in train_files if f'measurementSeries_{val_campaign}' not in str(f)]
-    val_files_inner   = [f for f in train_files if f'measurementSeries_{val_campaign}' in str(f)]
+    # supervised_transform normalises each window to [-1, 1]
+    # applied consistently in both train and evaluate
+    full_dataset = ORIONDataset(train_files, transform=supervised_transform, cache_dir=cache_dir)
 
-    print(f'Inner train files : {len(train_files_inner)} (campaigns B, C, E)')
-    print(f'Val files         : {len(val_files_inner)} (campaign {val_campaign})')
-    print(f'Test files        : {len(test_files)} (campaign F -- held out completely)')
-
-    train_dataset = ORIONDataset(train_files_inner, transform=None, cache_dir=cache_dir)
-    val_dataset   = ORIONDataset(val_files_inner,   transform=None, cache_dir=cache_dir)
+    val_size   = int(len(full_dataset) * val_split)
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    print(f'Train windows : {len(train_dataset):,}')
-    print(f'Val windows   : {len(val_dataset):,}')
+    print(f'Train windows : {train_size:,}')
+    print(f'Val windows   : {val_size:,}')
     print(f'Batches/epoch : {len(train_loader)}')
 
     encoder_path = encoder_weights if Path(encoder_weights).exists() else None
@@ -71,13 +67,9 @@ def train_phase2(
         print('Encoder frozen -- only transformer and classifier will train')
 
     criterion = nn.CrossEntropyLoss()
-
-    # weight_decay adds L2 regularisation -- penalises large weights
-    # prevents model from memorising campaign-specific patterns
     optimiser = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        weight_decay=weight_decay
+        lr=lr
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode='min', patience=5, factor=0.5
@@ -91,7 +83,6 @@ def train_phase2(
 
     for epoch in range(num_epochs):
 
-        # training
         model.train()
         train_loss    = 0.0
         train_correct = 0
@@ -112,7 +103,6 @@ def train_phase2(
         avg_train_loss = train_loss / len(train_loader)
         train_acc      = train_correct / train_total
 
-        # validation
         model.eval()
         val_loss    = 0.0
         val_correct = 0
@@ -170,8 +160,10 @@ def evaluate(
                           'cuda' if torch.cuda.is_available() else 'cpu')
 
     _, test_files = get_split_files(data_dir)
-    test_dataset  = ORIONDataset(test_files, transform=None, cache_dir=cache_dir)
-    test_loader   = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # same supervised_transform as training -- critical for correct evaluation
+    test_dataset = ORIONDataset(test_files, transform=supervised_transform, cache_dir=cache_dir)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     print(f'Test windows: {len(test_dataset):,}')
 
@@ -221,10 +213,9 @@ if __name__ == '__main__':
         num_layers      = 2,
         batch_size      = 64,
         num_epochs      = 75,
-        lr              = 3e-5,
-        dropout         = 0.3,
-        val_campaign    = 'D',
+        lr              = 1e-4,
+        dropout         = 0.1,
+        val_split       = 0.1,
         freeze_encoder  = False,
         cache_dir       = 'data/processed/cache',
-        weight_decay    = 1e-4,
     )
