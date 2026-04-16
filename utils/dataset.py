@@ -13,7 +13,6 @@ FS            = 5_000_000
 TRAIN_CAMPAIGNS = ['B', 'C', 'D', 'E']
 TEST_CAMPAIGNS  = ['F']
 
-# 0-indexed for PyTorch CrossEntropyLoss
 TORQUE_TO_CLASS = {
     '05': 0,
     '10': 1,
@@ -38,8 +37,6 @@ NUM_CLASSES = 7
 
 
 def parse_filename(filepath):
-    # extract torque level and campaign from filename
-    # e.g. salves_out_05cNm_B_Fs5MHz_... -> torque='05', campaign='B'
     name  = Path(filepath).name
     match = re.search(r'_(\d{2})cNm_([BCDEF])_', name)
     if not match:
@@ -56,8 +53,6 @@ def parse_filename(filepath):
 
 
 def load_mat_signals(filepath):
-    # load one .mat file and return AE channels A, B, C as (3, N) float32
-    # channel D is the vibrometer -- excluded, validation only
     mat = scipy.io.loadmat(filepath)
     signals = np.stack([
         mat['A'].squeeze(),
@@ -68,7 +63,6 @@ def load_mat_signals(filepath):
 
 
 def get_split_files(data_dir):
-    # split all .mat files into train (B,C,D,E) and test (F) by campaign
     data_dir    = Path(data_dir)
     all_files   = sorted(data_dir.rglob('*.mat'))
     train_files = []
@@ -85,40 +79,29 @@ def get_split_files(data_dir):
 
 
 def preprocess_and_cache(files, cache_dir, window_size=WINDOW_SIZE, stride=WINDOW_STRIDE):
-    # pre-process all .mat files into windowed tensors and save to disk
-    # run once -- subsequent training loads from cache instead of raw .mat files
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-
     total_windows = 0
     for i, filepath in enumerate(files):
-        info     = parse_filename(filepath)
-        label    = info['class_label']
+        info       = parse_filename(filepath)
+        label      = info['class_label']
         cache_path = cache_dir / (filepath.stem + '.pt')
-
         if cache_path.exists():
-            # already cached -- skip
-            data = torch.load(cache_path, weights_only=True)
+            data           = torch.load(cache_path, weights_only=True)
             total_windows += data['windows'].shape[0]
             continue
-
-        # load and window
-        signals  = load_mat_signals(filepath)   # (3, N)
-        n        = signals.shape[1]
-        starts   = list(range(0, n - window_size + 1, stride))
-        windows  = np.stack([signals[:, s:s+window_size] for s in starts])  # (n_windows, 3, window_size)
-
+        signals = load_mat_signals(filepath)
+        n       = signals.shape[1]
+        starts  = list(range(0, n - window_size + 1, stride))
+        windows = np.stack([signals[:, s:s+window_size] for s in starts])
         torch.save({
-            'windows': torch.from_numpy(windows),   # (n_windows, 3, 10000) float32
+            'windows': torch.from_numpy(windows),
             'label'  : label,
             'file'   : filepath.name,
         }, cache_path)
-
         total_windows += len(starts)
-
         if (i + 1) % 20 == 0 or (i + 1) == len(files):
             print(f'  cached {i+1}/{len(files)} files  ({total_windows:,} windows so far)')
-
     print(f'Cache complete: {total_windows:,} windows in {cache_dir}')
     return total_windows
 
@@ -131,51 +114,34 @@ class ORIONDataset(Dataset):
         self.window_size = window_size
         self.stride      = stride
         self.cache_dir   = Path(cache_dir) if cache_dir else None
-
-        if self.cache_dir and self.cache_dir.exists():
-            self._build_index_from_cache()
-        else:
-            self._build_index()
-
-    def _build_index_from_cache(self):
-        # build index from pre-cached .pt files -- much faster than reading .mat files
-        self.index      = []
-        self.cache_data = {}   # filepath.stem -> loaded tensor dict
-
-        for filepath in self.files:
-            cache_path = self.cache_dir / (filepath.stem + '.pt')
-            if not cache_path.exists():
-                print(f'WARNING: cache missing for {filepath.name} -- falling back to raw load')
-                info      = parse_filename(filepath)
-                label     = info['class_label']
-                mat       = scipy.io.loadmat(filepath, variable_names=['A'])
-                n_samples = mat['A'].shape[0]
-                for s in range(0, n_samples - self.window_size + 1, self.stride):
-                    self.index.append(('raw', filepath, label, s))
-                continue
-
-            # load cache into memory
-            data = torch.load(cache_path, weights_only=True)
-            key  = filepath.stem
-            self.cache_data[key] = data
-
-            label      = data['label']
-            n_windows  = data['windows'].shape[0]
-            for i in range(n_windows):
-                self.index.append(('cached', key, label, i))
-
-        print(f'Dataset built from cache: {len(self.index):,} windows from {len(self.files)} files')
+        self._build_index()
 
     def _build_index(self):
-        # build index from raw .mat files -- slower but no cache needed
+        # build index only -- do NOT load data into RAM
+        # each __getitem__ loads from disk on demand
+        # this keeps RAM usage low -- works on Colab (12GB) and Mac
         self.index = []
+
         for filepath in self.files:
-            info      = parse_filename(filepath)
-            label     = info['class_label']
+            info  = parse_filename(filepath)
+            label = info['class_label']
+
+            if self.cache_dir:
+                cache_path = self.cache_dir / (filepath.stem + '.pt')
+                if cache_path.exists():
+                    # just read the number of windows without loading data
+                    data      = torch.load(cache_path, weights_only=True)
+                    n_windows = data['windows'].shape[0]
+                    for i in range(n_windows):
+                        self.index.append(('cached', str(cache_path), label, i))
+                    continue
+
+            # fallback -- raw .mat file
             mat       = scipy.io.loadmat(filepath, variable_names=['A'])
             n_samples = mat['A'].shape[0]
             for s in range(0, n_samples - self.window_size + 1, self.stride):
-                self.index.append((filepath, label, s))
+                self.index.append(('raw', str(filepath), label, s))
+
         print(f'Dataset built: {len(self.index):,} windows from {len(self.files)} files')
 
     def __len__(self):
@@ -185,12 +151,12 @@ class ORIONDataset(Dataset):
         entry = self.index[idx]
 
         if entry[0] == 'cached':
-            # fast path -- load from in-memory cache
-            _, key, label, window_idx = entry
-            window = self.cache_data[key]['windows'][window_idx]   # (3, 10000)
+            _, cache_path, label, window_idx = entry
+            # load only this specific file from disk -- not everything into RAM
+            data   = torch.load(cache_path, weights_only=True)
+            window = data['windows'][window_idx]
         else:
-            # slow path -- load from raw .mat file
-            filepath, label, start = entry
+            _, filepath, label, start = entry
             signals = load_mat_signals(filepath)
             window  = torch.from_numpy(signals[:, start:start + self.window_size])
 
@@ -208,15 +174,12 @@ if __name__ == '__main__':
 
     train_files, test_files = get_split_files(DATA_DIR)
 
-    # pre-process and cache all train + test files
-    # run this once -- takes ~30 minutes, saves ~32 GB to data/processed/cache/
     print('\nCaching train files...')
     preprocess_and_cache(train_files, CACHE_DIR)
 
     print('\nCaching test files...')
     preprocess_and_cache(test_files, CACHE_DIR)
 
-    # test loading from cache
     print('\nTesting cached dataset...')
     dataset       = ORIONDataset(train_files[:2], cache_dir=CACHE_DIR)
     window, label = dataset[0]
