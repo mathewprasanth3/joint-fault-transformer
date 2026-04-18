@@ -1,13 +1,13 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from pathlib import Path
 import sys
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from utils.dataset import ORIONDataset, get_split_files, NUM_CLASSES
-from utils.transforms import supervised_transform
+from utils.transforms import domain_augment_transform, supervised_transform
 from models.transformer.model import JointFaultTransformer
 
 
@@ -26,20 +26,38 @@ def train_phase2(
     num_workers      = 0,
     freeze_encoder   = False,
     cache_dir        = 'data/processed/cache',
+    test_campaign    = 'E',
 ):
     device = torch.device('mps' if torch.backends.mps.is_available() else
                           'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
-    train_files, test_files = get_split_files(data_dir)
+    train_files, f_files = get_split_files(data_dir)
 
-    # supervised_transform normalises each window to [-1, 1]
-    # applied consistently in both train and evaluate
-    full_dataset = ORIONDataset(train_files, transform=supervised_transform, cache_dir=cache_dir)
+    # train on B, C, D, F -- test on E
+    # including F gives more diverse training data across 4 campaigns
+    # E is completely held out -- never seen during training
+    inner_train_files = [f for f in train_files if f'measurementSeries_{test_campaign}' not in str(f)] + f_files
+    test_files_inner  = [f for f in train_files if f'measurementSeries_{test_campaign}' in str(f)]
 
-    val_size   = int(len(full_dataset) * val_split)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    print(f'Train files : {len(inner_train_files)} (campaigns B, C, D, F)')
+    print(f'Test files  : {len(test_files_inner)} (campaign {test_campaign} -- held out)')
+
+    # domain_augment_transform for training -- simulates sensor coupling variations
+    # supervised_transform for validation -- clean normalised signals, no augmentation
+    full_train = ORIONDataset(inner_train_files, transform=domain_augment_transform, cache_dir=cache_dir)
+    full_val   = ORIONDataset(inner_train_files, transform=supervised_transform,      cache_dir=cache_dir)
+
+    # consistent val split using fixed seed
+    n          = len(full_train)
+    val_size   = int(n * val_split)
+    train_size = n - val_size
+    indices    = torch.randperm(n, generator=torch.Generator().manual_seed(42)).tolist()
+    train_idx  = indices[:train_size]
+    val_idx    = indices[train_size:]
+
+    train_dataset = Subset(full_train, train_idx)
+    val_dataset   = Subset(full_val,   val_idx)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
@@ -152,6 +170,7 @@ def evaluate(
     batch_size    = 64,
     num_workers   = 0,
     cache_dir     = 'data/processed/cache',
+    test_campaign = 'E',
 ):
     from sklearn.metrics import classification_report, confusion_matrix
     import numpy as np
@@ -159,9 +178,11 @@ def evaluate(
     device = torch.device('mps' if torch.backends.mps.is_available() else
                           'cuda' if torch.cuda.is_available() else 'cpu')
 
-    _, test_files = get_split_files(data_dir)
+    train_files, _ = get_split_files(data_dir)
+    test_files     = [f for f in train_files if f'measurementSeries_{test_campaign}' in str(f)]
+    print(f'Evaluating on campaign {test_campaign}: {len(test_files)} files')
 
-    # same supervised_transform as training -- critical for correct evaluation
+    # supervised_transform only -- no augmentation at test time
     test_dataset = ORIONDataset(test_files, transform=supervised_transform, cache_dir=cache_dir)
     test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
@@ -191,7 +212,7 @@ def evaluate(
     all_labels = np.array(all_labels)
 
     accuracy = (all_preds == all_labels).mean()
-    print(f'\nTest accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)')
+    print(f'\nTest accuracy on campaign {test_campaign}: {accuracy:.4f} ({accuracy*100:.2f}%)')
 
     class_names = ['05cNm', '10cNm', '20cNm', '30cNm', '40cNm', '50cNm', '60cNm']
     print('\nClassification report:')
@@ -218,4 +239,5 @@ if __name__ == '__main__':
         val_split       = 0.1,
         freeze_encoder  = False,
         cache_dir       = 'data/processed/cache',
+        test_campaign   = 'E',
     )
