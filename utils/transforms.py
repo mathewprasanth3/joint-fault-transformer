@@ -104,10 +104,10 @@ simclr_transform = Compose([
 # used during Phase 2 training when doing campaign-wise generalisation
 domain_augment_transform = Compose([
     Normalise(),
-    AddNoise(std=0.05),
-    RandomScale(scale=0.4),
-    RandomDCOffset(offset=0.1),
-    RandomCrop(crop_ratio=0.1),
+    AddNoise(std=0.02),       # reduced from 0.05
+    RandomScale(scale=0.2),   # reduced from 0.4
+    RandomDCOffset(offset=0.05),  # reduced from 0.1
+    RandomCrop(crop_ratio=0.05),  # reduced from 0.1
 ])
 
 

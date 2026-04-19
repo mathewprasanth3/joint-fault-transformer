@@ -1,13 +1,13 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 import sys
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from utils.dataset import ORIONDataset, get_split_files, NUM_CLASSES
-from utils.transforms import domain_augment_transform, supervised_transform
+from utils.transforms import supervised_transform
 from models.transformer.model import JointFaultTransformer
 
 
@@ -22,48 +22,42 @@ def train_phase2(
     num_epochs       = 75,
     lr               = 1e-4,
     dropout          = 0.1,
+    train_split      = 0.8,
     val_split        = 0.1,
     num_workers      = 0,
     freeze_encoder   = False,
     cache_dir        = 'data/processed/cache',
-    test_campaign    = 'E',
 ):
     device = torch.device('mps' if torch.backends.mps.is_available() else
                           'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
+    # use ALL files from all campaigns B, C, D, E, F -- random split
     train_files, f_files = get_split_files(data_dir)
+    all_files = train_files + f_files
 
-    # train on B, C, D, F -- test on E
-    # including F gives more diverse training data across 4 campaigns
-    # E is completely held out -- never seen during training
-    inner_train_files = [f for f in train_files if f'measurementSeries_{test_campaign}' not in str(f)] + f_files
-    test_files_inner  = [f for f in train_files if f'measurementSeries_{test_campaign}' in str(f)]
+    print(f'Total files : {len(all_files)} (all campaigns B, C, D, E, F)')
 
-    print(f'Train files : {len(inner_train_files)} (campaigns B, C, D, F)')
-    print(f'Test files  : {len(test_files_inner)} (campaign {test_campaign} -- held out)')
+    # build full dataset with supervised_transform
+    full_dataset = ORIONDataset(all_files, transform=supervised_transform, cache_dir=cache_dir)
 
-    # domain_augment_transform for training -- simulates sensor coupling variations
-    # supervised_transform for validation -- clean normalised signals, no augmentation
-    full_train = ORIONDataset(inner_train_files, transform=domain_augment_transform, cache_dir=cache_dir)
-    full_val   = ORIONDataset(inner_train_files, transform=supervised_transform,      cache_dir=cache_dir)
+    # random 80/10/10 split with fixed seed for reproducibility
+    total      = len(full_dataset)
+    test_size  = int(total * (1 - train_split))
+    val_size   = int((total - test_size) * val_split)
+    train_size = total - test_size - val_size
 
-    # consistent val split using fixed seed
-    n          = len(full_train)
-    val_size   = int(n * val_split)
-    train_size = n - val_size
-    indices    = torch.randperm(n, generator=torch.Generator().manual_seed(42)).tolist()
-    train_idx  = indices[:train_size]
-    val_idx    = indices[train_size:]
-
-    train_dataset = Subset(full_train, train_idx)
-    val_dataset   = Subset(full_val,   val_idx)
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     print(f'Train windows : {train_size:,}')
     print(f'Val windows   : {val_size:,}')
+    print(f'Test windows  : {test_size:,}')
     print(f'Batches/epoch : {len(train_loader)}')
 
     encoder_path = encoder_weights if Path(encoder_weights).exists() else None
@@ -170,7 +164,6 @@ def evaluate(
     batch_size    = 64,
     num_workers   = 0,
     cache_dir     = 'data/processed/cache',
-    test_campaign = 'E',
 ):
     from sklearn.metrics import classification_report, confusion_matrix
     import numpy as np
@@ -178,14 +171,22 @@ def evaluate(
     device = torch.device('mps' if torch.backends.mps.is_available() else
                           'cuda' if torch.cuda.is_available() else 'cpu')
 
-    train_files, _ = get_split_files(data_dir)
-    test_files     = [f for f in train_files if f'measurementSeries_{test_campaign}' in str(f)]
-    print(f'Evaluating on campaign {test_campaign}: {len(test_files)} files')
+    # rebuild same split with same seed
+    train_files, f_files = get_split_files(data_dir)
+    all_files    = train_files + f_files
+    full_dataset = ORIONDataset(all_files, transform=supervised_transform, cache_dir=cache_dir)
 
-    # supervised_transform only -- no augmentation at test time
-    test_dataset = ORIONDataset(test_files, transform=supervised_transform, cache_dir=cache_dir)
-    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    total      = len(full_dataset)
+    test_size  = int(total * 0.2)
+    val_size   = int((total - test_size) * 0.1)
+    train_size = total - test_size - val_size
 
+    _, _, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     print(f'Test windows: {len(test_dataset):,}')
 
     model = JointFaultTransformer(
@@ -212,7 +213,7 @@ def evaluate(
     all_labels = np.array(all_labels)
 
     accuracy = (all_preds == all_labels).mean()
-    print(f'\nTest accuracy on campaign {test_campaign}: {accuracy:.4f} ({accuracy*100:.2f}%)')
+    print(f'\nTest accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)')
 
     class_names = ['05cNm', '10cNm', '20cNm', '30cNm', '40cNm', '50cNm', '60cNm']
     print('\nClassification report:')
@@ -236,8 +237,8 @@ if __name__ == '__main__':
         num_epochs      = 75,
         lr              = 1e-4,
         dropout         = 0.1,
+        train_split     = 0.8,
         val_split       = 0.1,
         freeze_encoder  = False,
         cache_dir       = 'data/processed/cache',
-        test_campaign   = 'E',
     )
