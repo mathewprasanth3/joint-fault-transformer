@@ -1,0 +1,7 @@
+gradio
+torch
+scipy
+numpy
+matplotlib
+huggingface_hub
+scikit-learn
