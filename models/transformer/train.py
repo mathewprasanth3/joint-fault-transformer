@@ -14,7 +14,7 @@ from models.transformer.model import JointFaultTransformer
 def train_phase2(
     data_dir,
     encoder_weights  = 'models/encoder/weights/simclr_encoder.pt',
-    save_path        = 'models/transformer/weights/best_model.pt',
+    save_path        = 'models/transformer/weights/best_model_bcde.pt',
     embedding_dim    = 128,
     num_heads        = 4,
     num_layers       = 2,
@@ -32,14 +32,12 @@ def train_phase2(
                           'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
-    # use ALL files from all campaigns B, C, D, E, F -- random split
-    train_files, f_files = get_split_files(data_dir)
-    all_files = train_files + f_files
+    # train on B, C, D, E only -- campaign F held out for cross-campaign eval
+    train_files, _ = get_split_files(data_dir)
 
-    print(f'Total files : {len(all_files)} (all campaigns B, C, D, E, F)')
+    print(f'Total files : {len(train_files)} (campaigns B, C, D, E only)')
 
-    # build full dataset with supervised_transform
-    full_dataset = ORIONDataset(all_files, transform=supervised_transform, cache_dir=cache_dir)
+    full_dataset = ORIONDataset(train_files, transform=supervised_transform, cache_dir=cache_dir)
 
     # random 80/10/10 split with fixed seed for reproducibility
     total      = len(full_dataset)
@@ -157,7 +155,7 @@ def train_phase2(
 
 def evaluate(
     data_dir,
-    model_path    = 'models/transformer/weights/best_model.pt',
+    model_path    = 'models/transformer/weights/best_model_bcde.pt',
     embedding_dim = 128,
     num_heads     = 4,
     num_layers    = 2,
@@ -171,10 +169,9 @@ def evaluate(
     device = torch.device('mps' if torch.backends.mps.is_available() else
                           'cuda' if torch.cuda.is_available() else 'cpu')
 
-    # rebuild same split with same seed
-    train_files, f_files = get_split_files(data_dir)
-    all_files    = train_files + f_files
-    full_dataset = ORIONDataset(all_files, transform=supervised_transform, cache_dir=cache_dir)
+    # rebuild same split with same seed -- B, C, D, E only
+    train_files, _ = get_split_files(data_dir)
+    full_dataset   = ORIONDataset(train_files, transform=supervised_transform, cache_dir=cache_dir)
 
     total      = len(full_dataset)
     test_size  = int(total * 0.2)
@@ -229,7 +226,7 @@ if __name__ == '__main__':
     train_phase2(
         data_dir        = DATA_DIR,
         encoder_weights = 'models/encoder/weights/simclr_encoder.pt',
-        save_path       = 'models/transformer/weights/best_model.pt',
+        save_path       = 'models/transformer/weights/best_model_bcde.pt',
         embedding_dim   = 128,
         num_heads       = 4,
         num_layers      = 2,
